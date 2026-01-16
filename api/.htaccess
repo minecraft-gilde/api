@@ -1,0 +1,10 @@
+Options -Indexes
+RewriteEngine On
+
+# Nur GET/OPTIONS zulassen (POST/PUT/DELETE sperren)
+RewriteCond %{REQUEST_METHOD} !^(GET|OPTIONS)$
+RewriteRule ^ - [R=405,L]
+
+# Alles auf index.php routen
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteRule ^ index.php [QSA,L]
