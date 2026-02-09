@@ -27,3 +27,10 @@ define('API_CACHE_PLAYER', 60);
 
 // Kleine Übersichten / KPIs
 define('API_CACHE_SUMMARY', 60);
+
+// Mojang Sessionserver Hybrid-Cache (Profile/Cape)
+define('API_CACHE_PROFILE_FRESH', 6 * 3600);
+define('API_CACHE_PROFILE_NEGATIVE', 10 * 60);
+define('API_CACHE_PROFILE_STALE_ON_ERROR', 30);
+define('API_CACHE_PROFILE_STALE_WHILE_REVALIDATE', 30);
+define('API_CACHE_PROFILE_STALE_IF_ERROR', 24 * 3600);

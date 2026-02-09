@@ -81,8 +81,12 @@ function api_uuid_bin_to_dashed(string $bin16): string {
   return substr($hex, 0, 8) . '-' . substr($hex, 8, 4) . '-' . substr($hex, 12, 4) . '-' . substr($hex, 16, 4) . '-' . substr($hex, 20, 12);
 }
 
-function api_cache_headers(string $etag, int $maxAge, ?int $lastModifiedTs = null): void {
-  header('Cache-Control: public, max-age=' . $maxAge);
+function api_cache_headers(string $etag, int $maxAge, ?int $lastModifiedTs = null, string $extraCacheControl = ''): void {
+  $cacheControl = 'public, max-age=' . $maxAge;
+  if ($extraCacheControl !== '') {
+    $cacheControl .= ', ' . $extraCacheControl;
+  }
+  header('Cache-Control: ' . $cacheControl);
   header('ETag: "' . $etag . '"');
   if ($lastModifiedTs !== null) {
     header('Last-Modified: ' . gmdate('D, d M Y H:i:s', $lastModifiedTs) . ' GMT');

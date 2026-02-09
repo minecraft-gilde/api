@@ -78,6 +78,232 @@ function fetch_players_by_hex(PDO $pdo, array $uuidHexList): array {
   }
   return $out;
 }
+function profile_cache_extra_directives(): string {
+  return 'stale-while-revalidate=' . (int)API_CACHE_PROFILE_STALE_WHILE_REVALIDATE
+    . ', stale-if-error=' . (int)API_CACHE_PROFILE_STALE_IF_ERROR;
+}
+
+function profile_cache_write_atomic(string $path, string $data): bool {
+  try {
+    $suffix = bin2hex(random_bytes(6));
+  } catch (Throwable $e) {
+    $suffix = str_replace('.', '', (string)microtime(true));
+  }
+
+  $tmp = $path . '.' . $suffix . '.tmp';
+  if (@file_put_contents($tmp, $data, LOCK_EX) === false) {
+    @unlink($tmp);
+    return false;
+  }
+  if (!@rename($tmp, $path)) {
+    @unlink($tmp);
+    return false;
+  }
+  return true;
+}
+
+function profile_cache_try_fresh(string $positiveFile, string $negativeFile, int $ttlFresh, int $ttlNegative): ?array {
+  $now = time();
+
+  if (is_file($positiveFile)) {
+    clearstatcache(true, $positiveFile);
+    $mtime = (int)(filemtime($positiveFile) ?: 0);
+    $age = max(0, $now - $mtime);
+    if ($mtime > 0 && $age < $ttlFresh) {
+      $body = @file_get_contents($positiveFile);
+      if (is_string($body) && $body !== '') {
+        return [
+          'type' => 'positive',
+          'body' => $body,
+          'mtime' => $mtime,
+          'max_age' => max(1, $ttlFresh - $age),
+        ];
+      }
+    }
+  }
+
+  if (is_file($negativeFile)) {
+    clearstatcache(true, $negativeFile);
+    $mtime = (int)(filemtime($negativeFile) ?: 0);
+    $age = max(0, $now - $mtime);
+    if ($mtime > 0 && $age < $ttlNegative) {
+      return [
+        'type' => 'negative',
+        'body' => '{}',
+        'mtime' => $mtime,
+        'max_age' => max(1, $ttlNegative - $age),
+      ];
+    }
+  }
+
+  return null;
+}
+
+function profile_cache_try_stale(string $positiveFile, string $negativeFile, int $ttlStale): ?array {
+  if (is_file($positiveFile)) {
+    clearstatcache(true, $positiveFile);
+    $mtime = (int)(filemtime($positiveFile) ?: time());
+    $body = @file_get_contents($positiveFile);
+    if (is_string($body) && $body !== '') {
+      return [
+        'type' => 'positive',
+        'body' => $body,
+        'mtime' => $mtime,
+        'max_age' => $ttlStale,
+      ];
+    }
+  }
+
+  if (is_file($negativeFile)) {
+    clearstatcache(true, $negativeFile);
+    $mtime = (int)(filemtime($negativeFile) ?: time());
+    return [
+      'type' => 'negative',
+      'body' => '{}',
+      'mtime' => $mtime,
+      'max_age' => $ttlStale,
+    ];
+  }
+
+  return null;
+}
+
+function fetch_mojang_profile_cached(string $uuidHex): array {
+  $cacheDir  = __DIR__ . '/cache';
+  $cacheFile = $cacheDir . '/profile-' . $uuidHex . '.json';
+  $negFile   = $cacheDir . '/profile-' . $uuidHex . '.neg';
+  $lockFile  = $cacheDir . '/profile-' . $uuidHex . '.lock';
+
+  $ttlFresh = (int)API_CACHE_PROFILE_FRESH;
+  $ttlNegative = (int)API_CACHE_PROFILE_NEGATIVE;
+  $ttlStaleOnError = (int)API_CACHE_PROFILE_STALE_ON_ERROR;
+
+  if (!is_dir($cacheDir) && !@mkdir($cacheDir, 0775, true) && !is_dir($cacheDir)) {
+    return ['ok' => false, 'status' => 500, 'error' => 'cannot create cache dir'];
+  }
+  if (!is_writable($cacheDir)) {
+    return ['ok' => false, 'status' => 500, 'error' => 'cache dir not writable'];
+  }
+
+  $fresh = profile_cache_try_fresh($cacheFile, $negFile, $ttlFresh, $ttlNegative);
+  if ($fresh !== null) {
+    return ['ok' => true] + $fresh;
+  }
+
+  $lockFp = @fopen($lockFile, 'c');
+  if ($lockFp) {
+    @flock($lockFp, LOCK_EX);
+  }
+
+  try {
+    $fresh = profile_cache_try_fresh($cacheFile, $negFile, $ttlFresh, $ttlNegative);
+    if ($fresh !== null) {
+      return ['ok' => true] + $fresh;
+    }
+
+    $url = "https://sessionserver.mojang.com/session/minecraft/profile/$uuidHex";
+    $ctx = stream_context_create([
+      'http' => [
+        'timeout' => 3,
+        'ignore_errors' => true,
+        'header' => "Accept: application/json\r\nUser-Agent: minecraft-gilde.de api\r\n",
+      ],
+      'ssl' => [
+        'verify_peer' => true,
+        'verify_peer_name' => true,
+      ],
+    ]);
+
+    $body = @file_get_contents($url, false, $ctx);
+
+    $status = 0;
+    if (isset($http_response_header[0]) && preg_match('/\s(\d{3})\s/', (string)$http_response_header[0], $m)) {
+      $status = (int)$m[1];
+    }
+
+    if ($status === 200 && is_string($body) && $body !== '') {
+      json_decode($body, true);
+      if (json_last_error() === JSON_ERROR_NONE && profile_cache_write_atomic($cacheFile, $body)) {
+        @unlink($negFile);
+        clearstatcache(true, $cacheFile);
+        $mtime = (int)(filemtime($cacheFile) ?: time());
+        return [
+          'ok' => true,
+          'type' => 'positive',
+          'body' => $body,
+          'mtime' => $mtime,
+          'max_age' => $ttlFresh,
+        ];
+      }
+    }
+
+    if (in_array($status, [204, 404], true)) {
+      if (profile_cache_write_atomic($negFile, (string)$status)) {
+        @unlink($cacheFile);
+        clearstatcache(true, $negFile);
+        $mtime = (int)(filemtime($negFile) ?: time());
+        return [
+          'ok' => true,
+          'type' => 'negative',
+          'body' => '{}',
+          'mtime' => $mtime,
+          'max_age' => $ttlNegative,
+        ];
+      }
+    }
+
+    $stale = profile_cache_try_stale($cacheFile, $negFile, $ttlStaleOnError);
+    if ($stale !== null) {
+      return ['ok' => true] + $stale;
+    }
+
+    return ['ok' => false, 'status' => 502, 'error' => 'upstream error', 'upstream_status' => $status];
+  } finally {
+    if ($lockFp) {
+      @flock($lockFp, LOCK_UN);
+      @fclose($lockFp);
+    }
+  }
+}
+
+function extract_cape_from_profile(string $profileJson): ?array {
+  $profile = json_decode($profileJson, true);
+  if (!is_array($profile)) return null;
+  $properties = $profile['properties'] ?? null;
+  if (!is_array($properties)) return null;
+
+  foreach ($properties as $property) {
+    if (!is_array($property)) continue;
+    if (($property['name'] ?? '') !== 'textures') continue;
+    $value = $property['value'] ?? null;
+    if (!is_string($value) || $value === '') continue;
+
+    $decoded = base64_decode($value, true);
+    if (!is_string($decoded) || $decoded === '') continue;
+
+    $textures = json_decode($decoded, true);
+    if (!is_array($textures)) continue;
+
+    $cape = $textures['textures']['CAPE'] ?? null;
+    if (!is_array($cape)) return null;
+
+    $url = trim((string)($cape['url'] ?? ''));
+    if ($url === '') return null;
+
+    // Mojang liefert hier teils noch http-URLs; für Browser/Mixed-Content immer https ausgeben.
+    if (preg_match('#^http://textures\.minecraft\.net/#i', $url) === 1) {
+      $url = 'https://' . substr($url, 7);
+    }
+
+    $out = ['url' => $url];
+    if (isset($cape['alias']) && is_string($cape['alias']) && $cape['alias'] !== '') {
+      $out['alias'] = $cape['alias'];
+    }
+    return $out;
+  }
+
+  return null;
+}
 
 // ===== Endpoints =====
 try {
@@ -390,128 +616,65 @@ try {
 
 
 
-  if ($route === 'profile') {
-    // Mojang sessionserver proxy (für Skins/Capes) + Cache
-    $uuid = api_param_str('uuid', api_param_str('profile', ''));
-    $uuid = preg_replace('/[^0-9a-f]/i', '', (string)$uuid);
+  if ($route === 'cape') {
+    $rawUuid = api_param_str('uuid', api_param_str('cape', ''));
+    $uuidHex = api_uuid_hex($rawUuid);
+    if ($uuidHex === null) api_bad_request('invalid uuid');
 
-    if (strlen($uuid) !== 32) {
-      http_response_code(400);
-      header('Content-Type: application/json; charset=utf-8');
-      header('Cache-Control: no-store');
-      echo json_encode(['error' => 'invalid uuid'], JSON_UNESCAPED_UNICODE);
-      exit;
+    $cached = fetch_mojang_profile_cached($uuidHex);
+    if (!($cached['ok'] ?? false)) {
+      api_json([
+        'error' => (string)($cached['error'] ?? 'upstream error'),
+        'status' => (int)($cached['upstream_status'] ?? 0),
+      ], (int)($cached['status'] ?? 502));
+    }
+
+    $cape = null;
+    if (($cached['type'] ?? '') === 'positive') {
+      $cape = extract_cape_from_profile((string)$cached['body']);
+    }
+
+    $uuidDash = api_uuid_bin_to_dashed(api_uuid_hex_to_bin($uuidHex));
+    $capeUrlForEtag = is_array($cape) && isset($cape['url']) ? (string)$cape['url'] : 'none';
+    $etag = sha1('cape:' . $uuidHex . ':' . sha1((string)$cached['body']) . ':' . $capeUrlForEtag);
+    api_cache_headers(
+      $etag,
+      (int)($cached['max_age'] ?? API_CACHE_PROFILE_STALE_ON_ERROR),
+      isset($cached['mtime']) ? (int)$cached['mtime'] : null,
+      profile_cache_extra_directives()
+    );
+
+    api_json([
+      'found' => ($cached['type'] ?? '') !== 'negative',
+      'uuid' => $uuidDash,
+      'cape' => $cape,
+    ]);
+  }
+
+  if ($route === 'profile') {
+    $rawUuid = api_param_str('uuid', api_param_str('profile', ''));
+    $uuidHex = api_uuid_hex($rawUuid);
+    if ($uuidHex === null) api_bad_request('invalid uuid');
+
+    $cached = fetch_mojang_profile_cached($uuidHex);
+    if (!($cached['ok'] ?? false)) {
+      api_json([
+        'error' => (string)($cached['error'] ?? 'upstream error'),
+        'status' => (int)($cached['upstream_status'] ?? 0),
+      ], (int)($cached['status'] ?? 502));
     }
 
     header('Content-Type: application/json; charset=utf-8');
-
-    $cacheDir  = __DIR__ . '/cache';
-    $cacheFile = $cacheDir . '/profile-' . $uuid . '.json';
-    $lockFile  = $cacheDir . '/profile-' . $uuid . '.lock';
-
-    $ttlFresh        = 6 * 3600; // 6h
-    $ttlNegative     = 10 * 60;  // 10m
-    $ttlStaleOnError = 30;       // 30s
-
-    if (!is_dir($cacheDir) && !mkdir($cacheDir, 0775, true) && !is_dir($cacheDir)) {
-      http_response_code(500);
-      header('Cache-Control: no-store');
-      echo json_encode(['error' => 'cannot create cache dir'], JSON_UNESCAPED_UNICODE);
-      exit;
-    }
-    if (!is_writable($cacheDir)) {
-      http_response_code(500);
-      header('Cache-Control: no-store');
-      echo json_encode(['error' => 'cache dir not writable'], JSON_UNESCAPED_UNICODE);
-      exit;
-    }
-
-    $sendCached = function (int $maxAge) use ($cacheFile): void {
-      if (!is_file($cacheFile)) {
-        http_response_code(404);
-        header('Cache-Control: no-store');
-        echo '{}';
-        return;
-      }
-      clearstatcache(true, $cacheFile);
-      $mtime = filemtime($cacheFile) ?: time();
-      $size  = filesize($cacheFile) ?: 0;
-      $etag  = sha1($mtime . ':' . $size);
-      api_cache_headers($etag, $maxAge, $mtime);
-      readfile($cacheFile);
-    };
-
-    if (is_file($cacheFile) && (time() - (filemtime($cacheFile) ?: 0)) < $ttlFresh) {
-      $sendCached($ttlFresh);
-      exit;
-    }
-
-    $lockFp = @fopen($lockFile, 'c');
-    if ($lockFp) {
-      @flock($lockFp, LOCK_EX);
-    }
-
-    if (is_file($cacheFile) && (time() - (filemtime($cacheFile) ?: 0)) < $ttlFresh) {
-      if ($lockFp) { @flock($lockFp, LOCK_UN); @fclose($lockFp); }
-      $sendCached($ttlFresh);
-      exit;
-    }
-
-    $url = "https://sessionserver.mojang.com/session/minecraft/profile/$uuid";
-    $ctx = stream_context_create([
-      'http' => [
-        'timeout' => 3,
-        'ignore_errors' => true,
-        'header' => "Accept: application/json\r\nUser-Agent: minecraft-gilde.de api\r\n",
-      ],
-      'ssl' => [
-        'verify_peer' => true,
-        'verify_peer_name' => true,
-      ],
-    ]);
-
-    $body = @file_get_contents($url, false, $ctx);
-
-    $status = 0;
-    if (isset($http_response_header[0]) && preg_match('/\s(\d{3})\s/', $http_response_header[0], $m)) {
-      $status = (int)$m[1];
-    }
-
-    if ($status === 200 && is_string($body) && $body !== '') {
-      json_decode($body, true);
-      if (json_last_error() === JSON_ERROR_NONE) {
-        $tmp = $cacheFile . '.' . bin2hex(random_bytes(6)) . '.tmp';
-        file_put_contents($tmp, $body, LOCK_EX);
-        rename($tmp, $cacheFile);
-        if ($lockFp) { @flock($lockFp, LOCK_UN); @fclose($lockFp); }
-        $sendCached($ttlFresh);
-        exit;
-      }
-    }
-
-    if (in_array($status, [204, 404], true)) {
-      $tmp = $cacheFile . '.' . bin2hex(random_bytes(6)) . '.tmp';
-      file_put_contents($tmp, '{}', LOCK_EX);
-      rename($tmp, $cacheFile);
-      if ($lockFp) { @flock($lockFp, LOCK_UN); @fclose($lockFp); }
-      $sendCached($ttlNegative);
-      exit;
-    }
-
-    // Fehler: stale cache falls vorhanden
-    if (is_file($cacheFile)) {
-      if ($lockFp) { @flock($lockFp, LOCK_UN); @fclose($lockFp); }
-      $sendCached($ttlStaleOnError);
-      exit;
-    }
-
-    if ($lockFp) { @flock($lockFp, LOCK_UN); @fclose($lockFp); }
-    http_response_code(502);
-    header('Cache-Control: no-store');
-    echo json_encode(['error' => 'upstream error', 'status' => $status], JSON_UNESCAPED_UNICODE);
+    $etag = sha1('profile:' . $uuidHex . ':' . sha1((string)$cached['body']));
+    api_cache_headers(
+      $etag,
+      (int)($cached['max_age'] ?? API_CACHE_PROFILE_STALE_ON_ERROR),
+      isset($cached['mtime']) ? (int)$cached['mtime'] : null,
+      profile_cache_extra_directives()
+    );
+    echo (string)$cached['body'];
     exit;
   }
-
   // Unknown route
   api_not_found();
 
