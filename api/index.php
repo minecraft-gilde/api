@@ -528,18 +528,25 @@ try {
   if ($route === 'players') {
     $q = api_param_str('q', '');
     $q = mb_strtolower($q);
-    if (strlen($q) < 2) {
+    if (mb_strlen($q) < 2) {
       respond_with_generated(['items' => []], $generatedISO);
     }
 
     $limit = api_limit(min(api_param_int('limit', 8), (int)API_MAX_SEARCH));
+    $qLike = str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], $q);
 
     $stmt = $pdo->prepare("SELECT LOWER(HEX(uuid)) AS uuid_hex, name
                            FROM v_player_profile
-                           WHERE name_lc LIKE CONCAT(:q, '%')
-                           ORDER BY name_lc ASC, uuid ASC
+                           WHERE name_lc LIKE CONCAT('%', :q_contains, '%') ESCAPE '\\\\'
+                           ORDER BY
+                             CASE WHEN name_lc LIKE CONCAT(:q_prefix, '%') ESCAPE '\\\\' THEN 0 ELSE 1 END,
+                             LOCATE(:q_locate, name_lc) ASC,
+                             name_lc ASC,
+                             uuid ASC
                            LIMIT :lim");
-    $stmt->bindValue(':q', $q, PDO::PARAM_STR);
+    $stmt->bindValue(':q_contains', $qLike, PDO::PARAM_STR);
+    $stmt->bindValue(':q_prefix', $qLike, PDO::PARAM_STR);
+    $stmt->bindValue(':q_locate', $q, PDO::PARAM_STR);
     $stmt->bindValue(':lim', $limit, PDO::PARAM_INT);
     $stmt->execute();
 
